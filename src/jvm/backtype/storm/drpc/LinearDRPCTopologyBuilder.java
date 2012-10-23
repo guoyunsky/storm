@@ -2,11 +2,18 @@ package backtype.storm.drpc;
 
 import backtype.storm.Constants;
 import backtype.storm.ILocalDRPC;
-import backtype.storm.drpc.CoordinatedBolt.FinishedCallback;
-import backtype.storm.drpc.CoordinatedBolt.SourceArgs;
+import backtype.storm.coordination.BatchBoltExecutor;
+import backtype.storm.coordination.CoordinatedBolt;
+import backtype.storm.coordination.CoordinatedBolt.FinishedCallback;
+import backtype.storm.coordination.CoordinatedBolt.IdStreamSpec;
+import backtype.storm.coordination.CoordinatedBolt.SourceArgs;
+import backtype.storm.coordination.IBatchBolt;
 import backtype.storm.generated.StormTopology;
 import backtype.storm.generated.StreamInfo;
+import backtype.storm.grouping.CustomStreamGrouping;
+import backtype.storm.topology.BaseConfigurationDeclarer;
 import backtype.storm.topology.BasicBoltExecutor;
+import backtype.storm.topology.BoltDeclarer;
 import backtype.storm.topology.IBasicBolt;
 import backtype.storm.topology.IRichBolt;
 import backtype.storm.topology.InputDeclarer;
@@ -14,13 +21,13 @@ import backtype.storm.topology.OutputFieldsGetter;
 import backtype.storm.topology.TopologyBuilder;
 import backtype.storm.tuple.Fields;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 
-// need a "final bolt" method, that does fields groupings based on the first field of previous streams.
-// preparerequest needs to emit to a special stream to indicate which task in the last bolt is responsible for that id?
-// -- what if it's shuffle grouping all the way through? need to enforce that last bolt do fields grouping on id...
+// Trident subsumes the functionality provided by this class, so it's deprecated
+@Deprecated
 public class LinearDRPCTopologyBuilder {    
     String _function;
     List<Component> _components = new ArrayList<Component>();
@@ -30,22 +37,33 @@ public class LinearDRPCTopologyBuilder {
         _function = function;
     }
         
-    public LinearDRPCInputDeclarer addBolt(IRichBolt bolt, int parallelism) {
-        Component component = new Component(bolt, parallelism);
+    public LinearDRPCInputDeclarer addBolt(IBatchBolt bolt, Number parallelism) {
+        return addBolt(new BatchBoltExecutor(bolt), parallelism);
+    }
+    
+    public LinearDRPCInputDeclarer addBolt(IBatchBolt bolt) {
+        return addBolt(bolt, 1);
+    }
+    
+    @Deprecated
+    public LinearDRPCInputDeclarer addBolt(IRichBolt bolt, Number parallelism) {
+        if(parallelism==null) parallelism = 1; 
+        Component component = new Component(bolt, parallelism.intValue());
         _components.add(component);
         return new InputDeclarerImpl(component);
     }
     
+    @Deprecated
     public LinearDRPCInputDeclarer addBolt(IRichBolt bolt) {
-        return addBolt(bolt, 1);
+        return addBolt(bolt, null);
     }
     
-    public LinearDRPCInputDeclarer addBolt(IBasicBolt bolt, int parallelism) {
+    public LinearDRPCInputDeclarer addBolt(IBasicBolt bolt, Number parallelism) {
         return addBolt(new BasicBoltExecutor(bolt), parallelism);
     }
 
     public LinearDRPCInputDeclarer addBolt(IBasicBolt bolt) {
-        return addBolt(bolt, 1);
+        return addBolt(bolt, null);
     }
         
     public StormTopology createLocalTopology(ILocalDRPC drpc) {
@@ -58,84 +76,101 @@ public class LinearDRPCTopologyBuilder {
     
     
     private StormTopology createTopology(DRPCSpout spout) {
+        final String SPOUT_ID = "spout";
+        final String PREPARE_ID = "prepare-request";
+        
         TopologyBuilder builder = new TopologyBuilder();
-        builder.setSpout(1, spout);
-        builder.setBolt(2, new PrepareRequest())
-                .noneGrouping(1);
-        int id = 3;
-        for(int i=0; i<_components.size();i++) {
+        builder.setSpout(SPOUT_ID, spout);
+        builder.setBolt(PREPARE_ID, new PrepareRequest())
+                .noneGrouping(SPOUT_ID);
+        int i=0;
+        for(; i<_components.size();i++) {
             Component component = _components.get(i);
             
-            SourceArgs source;
-            if(i==0) {
-                source = null;
-            } else if (i==1) {
-                source = SourceArgs.single();
-            } else {
-                source = SourceArgs.all();
+            Map<String, SourceArgs> source = new HashMap<String, SourceArgs>();
+            if (i==1) {
+                source.put(boltId(i-1), SourceArgs.single());
+            } else if (i>=2) {
+                source.put(boltId(i-1), SourceArgs.all());
             }
-            Integer idComponent = null;
+            IdStreamSpec idSpec = null;
             if(i==_components.size()-1 && component.bolt instanceof FinishedCallback) {
-                idComponent = 2;
+                idSpec = IdStreamSpec.makeDetectSpec(PREPARE_ID, PrepareRequest.ID_STREAM);
             }
-            InputDeclarer declarer = builder.setBolt(
-                    id,
-                    new CoordinatedBolt(component.bolt, source, idComponent),
+            BoltDeclarer declarer = builder.setBolt(
+                    boltId(i),
+                    new CoordinatedBolt(component.bolt, source, idSpec),
                     component.parallelism);
-            if(idComponent!=null) {
-                declarer.fieldsGrouping(idComponent, PrepareRequest.ID_STREAM, new Fields("request"));
+            
+            for(Map conf: component.componentConfs) {
+                declarer.addConfigurations(conf);
             }
-            if(i==0 && component.declarations.size()==0) {
-                declarer.noneGrouping(2, PrepareRequest.ARGS_STREAM);
+            
+            if(idSpec!=null) {
+                declarer.fieldsGrouping(idSpec.getGlobalStreamId().get_componentId(), PrepareRequest.ID_STREAM, new Fields("request"));
+            }
+            if(i==0 && component.declarations.isEmpty()) {
+                declarer.noneGrouping(PREPARE_ID, PrepareRequest.ARGS_STREAM);
             } else {
+                String prevId;
+                if(i==0) {
+                    prevId = PREPARE_ID;
+                } else {
+                    prevId = boltId(i-1);
+                }
                 for(InputDeclaration declaration: component.declarations) {
-                    declaration.declare(id-1, declarer);
+                    declaration.declare(prevId, declarer);
                 }
             }
             if(i>0) {
-                declarer.directGrouping(id-1, Constants.COORDINATED_STREAM_ID); 
+                declarer.directGrouping(boltId(i-1), Constants.COORDINATED_STREAM_ID); 
             }
-            id++;
         }
         
         IRichBolt lastBolt = _components.get(_components.size()-1).bolt;
         OutputFieldsGetter getter = new OutputFieldsGetter();
         lastBolt.declareOutputFields(getter);
-        Map<Integer, StreamInfo> streams = getter.getFieldsDeclaration();
+        Map<String, StreamInfo> streams = getter.getFieldsDeclaration();
         if(streams.size()!=1) {
             throw new RuntimeException("Must declare exactly one stream from last bolt in LinearDRPCTopology");
         }
-        int outputStream = streams.keySet().iterator().next();
+        String outputStream = streams.keySet().iterator().next();
         List<String> fields = streams.get(outputStream).get_output_fields();
         if(fields.size()!=2) {
             throw new RuntimeException("Output stream of last component in LinearDRPCTopology must contain exactly two fields. The first should be the request id, and the second should be the result.");
         }
 
-        builder.setBolt(id, new JoinResult(2))
-                .fieldsGrouping(id-1, outputStream, new Fields(fields.get(0)))
-                .fieldsGrouping(2, PrepareRequest.RETURN_STREAM, new Fields("request"));
-        id++;
-        builder.setBolt(id, new ReturnResults())
-                .noneGrouping(id-1);
+        builder.setBolt(boltId(i), new JoinResult(PREPARE_ID))
+                .fieldsGrouping(boltId(i-1), outputStream, new Fields(fields.get(0)))
+                .fieldsGrouping(PREPARE_ID, PrepareRequest.RETURN_STREAM, new Fields("request"));
+        i++;
+        builder.setBolt(boltId(i), new ReturnResults())
+                .noneGrouping(boltId(i-1));
         return builder.createTopology();
+    }
+    
+    private static String boltId(int index) {
+        return "bolt" + index;
     }
     
     private static class Component {
         public IRichBolt bolt;
         public int parallelism;
+        public List<Map> componentConfs;
         public List<InputDeclaration> declarations = new ArrayList<InputDeclaration>();
         
         public Component(IRichBolt bolt, int parallelism) {
             this.bolt = bolt;
             this.parallelism = parallelism;
+            this.componentConfs = new ArrayList();
         }
     }
     
     private static interface InputDeclaration {
-        public void declare(int prevComponent, InputDeclarer declarer);
+        public void declare(String prevComponent, InputDeclarer declarer);
     }
     
-    private class InputDeclarerImpl implements LinearDRPCInputDeclarer {
+    private class InputDeclarerImpl extends BaseConfigurationDeclarer<LinearDRPCInputDeclarer> implements LinearDRPCInputDeclarer {
         Component _component;
         
         public InputDeclarerImpl(Component component) {
@@ -146,7 +181,7 @@ public class LinearDRPCTopologyBuilder {
         public LinearDRPCInputDeclarer fieldsGrouping(final Fields fields) {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.fieldsGrouping(prevComponent, fields);
                 }                
             });
@@ -154,10 +189,10 @@ public class LinearDRPCTopologyBuilder {
         }
 
         @Override
-        public LinearDRPCInputDeclarer fieldsGrouping(final int streamId, final Fields fields) {
+        public LinearDRPCInputDeclarer fieldsGrouping(final String streamId, final Fields fields) {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.fieldsGrouping(prevComponent, streamId, fields);
                 }                
             });
@@ -168,7 +203,7 @@ public class LinearDRPCTopologyBuilder {
         public LinearDRPCInputDeclarer globalGrouping() {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.globalGrouping(prevComponent);
                 }                
             });
@@ -176,10 +211,10 @@ public class LinearDRPCTopologyBuilder {
         }
 
         @Override
-        public LinearDRPCInputDeclarer globalGrouping(final int streamId) {
+        public LinearDRPCInputDeclarer globalGrouping(final String streamId) {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.globalGrouping(prevComponent, streamId);
                 }                
             });
@@ -190,7 +225,7 @@ public class LinearDRPCTopologyBuilder {
         public LinearDRPCInputDeclarer shuffleGrouping() {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.shuffleGrouping(prevComponent);
                 }                
             });
@@ -198,10 +233,10 @@ public class LinearDRPCTopologyBuilder {
         }
 
         @Override
-        public LinearDRPCInputDeclarer shuffleGrouping(final int streamId) {
+        public LinearDRPCInputDeclarer shuffleGrouping(final String streamId) {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.shuffleGrouping(prevComponent, streamId);
                 }                
             });
@@ -209,10 +244,32 @@ public class LinearDRPCTopologyBuilder {
         }
 
         @Override
+        public LinearDRPCInputDeclarer localOrShuffleGrouping() {
+            addDeclaration(new InputDeclaration() {
+                @Override
+                public void declare(String prevComponent, InputDeclarer declarer) {
+                    declarer.localOrShuffleGrouping(prevComponent);
+                }                
+            });
+            return this;
+        }
+
+        @Override
+        public LinearDRPCInputDeclarer localOrShuffleGrouping(final String streamId) {
+            addDeclaration(new InputDeclaration() {
+                @Override
+                public void declare(String prevComponent, InputDeclarer declarer) {
+                    declarer.localOrShuffleGrouping(prevComponent, streamId);
+                }                
+            });
+            return this;
+        }
+        
+        @Override
         public LinearDRPCInputDeclarer noneGrouping() {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.noneGrouping(prevComponent);
                 }                
             });
@@ -220,10 +277,10 @@ public class LinearDRPCTopologyBuilder {
         }
 
         @Override
-        public LinearDRPCInputDeclarer noneGrouping(final int streamId) {
+        public LinearDRPCInputDeclarer noneGrouping(final String streamId) {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.noneGrouping(prevComponent, streamId);
                 }                
             });
@@ -234,7 +291,7 @@ public class LinearDRPCTopologyBuilder {
         public LinearDRPCInputDeclarer allGrouping() {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.allGrouping(prevComponent);
                 }                
             });
@@ -242,10 +299,10 @@ public class LinearDRPCTopologyBuilder {
         }
 
         @Override
-        public LinearDRPCInputDeclarer allGrouping(final int streamId) {
+        public LinearDRPCInputDeclarer allGrouping(final String streamId) {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.allGrouping(prevComponent, streamId);
                 }                
             });
@@ -256,7 +313,7 @@ public class LinearDRPCTopologyBuilder {
         public LinearDRPCInputDeclarer directGrouping() {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.directGrouping(prevComponent);
                 }                
             });
@@ -264,11 +321,33 @@ public class LinearDRPCTopologyBuilder {
         }
 
         @Override
-        public LinearDRPCInputDeclarer directGrouping(final int streamId) {
+        public LinearDRPCInputDeclarer directGrouping(final String streamId) {
             addDeclaration(new InputDeclaration() {
                 @Override
-                public void declare(int prevComponent, InputDeclarer declarer) {
+                public void declare(String prevComponent, InputDeclarer declarer) {
                     declarer.directGrouping(prevComponent, streamId);
+                }                
+            });
+            return this;
+        }
+        
+        @Override
+        public LinearDRPCInputDeclarer customGrouping(final CustomStreamGrouping grouping) {
+            addDeclaration(new InputDeclaration() {
+                @Override
+                public void declare(String prevComponent, InputDeclarer declarer) {
+                    declarer.customGrouping(prevComponent, grouping);
+                }                
+            });
+            return this;
+        }
+
+        @Override
+        public LinearDRPCInputDeclarer customGrouping(final String streamId, final CustomStreamGrouping grouping) {
+            addDeclaration(new InputDeclaration() {
+                @Override
+                public void declare(String prevComponent, InputDeclarer declarer) {
+                    declarer.customGrouping(prevComponent, streamId, grouping);
                 }                
             });
             return this;
@@ -276,6 +355,12 @@ public class LinearDRPCTopologyBuilder {
         
         private void addDeclaration(InputDeclaration declaration) {
             _component.declarations.add(declaration);
-        }        
+        }
+
+        @Override
+        public LinearDRPCInputDeclarer addConfigurations(Map conf) {
+            _component.componentConfs.add(conf);
+            return this;
+        }
     }
 }

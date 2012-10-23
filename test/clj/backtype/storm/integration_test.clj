@@ -1,188 +1,164 @@
 (ns backtype.storm.integration-test
   (:use [clojure test])
-  (:import [backtype.storm.testing TestWordCounter TestWordSpout TestGlobalCount TestAggregatesCounter])
+  (:import [backtype.storm.topology TopologyBuilder])
+  (:import [backtype.storm.generated InvalidTopologyException])
+  (:import [backtype.storm.testing TestWordCounter TestWordSpout TestGlobalCount
+              TestAggregatesCounter TestConfBolt AckFailMapTracker])
   (:use [backtype.storm bootstrap testing])
   (:use [backtype.storm.daemon common])
   )
 
 (bootstrap)
 
-;; (deftest test-counter
-;;   (with-local-cluster [cluster :supervisors 4]
-;;     (let [state (:storm-cluster-state cluster)
-;;           nimbus (:nimbus cluster)
-;;           topology (thrift/mk-topology
-;;                     {1 (thrift/mk-spout-spec (TestWordSpout. true) :parallelism-hint 3)}
-;;                     {2 (thrift/mk-bolt-spec {1 ["word"]} (TestWordCounter.) :parallelism-hint 4)
-;;                      3 (thrift/mk-bolt-spec {1 :global} (TestGlobalCount.))
-;;                      4 (thrift/mk-bolt-spec {2 :global} (TestAggregatesCounter.))
-;;                      })]
-;;         (submit-local-topology nimbus
-;;                             "counter"
-;;                             {TOPOLOGY-OPTIMIZE false TOPOLOGY-WORKERS 20 TOPOLOGY-MESSAGE-TIMEOUT-SECS 3 TOPOLOGY-DEBUG true}
-;;                             topology)
-;;         (Thread/sleep 10000)
-;;         (.killTopology nimbus "counter")
-;;         (Thread/sleep 10000)
-;;         )))
-
-;; (deftest test-multilang-fy
-;;   (with-local-cluster [cluster :supervisors 4]
-;;     (let [nimbus (:nimbus cluster)
-;;           topology (thrift/mk-topology
-;;                       {1 (thrift/mk-spout-spec (TestWordSpout. false))}
-;;                       {2 (thrift/mk-shell-bolt-spec {1 :shuffle} "fancy" "tester.fy" ["word"] :parallelism-hint 1)}
-;;                       )]
-;;       (submit-local-topology nimbus
-;;                           "test"
-;;                           {TOPOLOGY-OPTIMIZE false TOPOLOGY-WORKERS 20 TOPOLOGY-MESSAGE-TIMEOUT-SECS 3 TOPOLOGY-DEBUG true}
-;;                           topology)
-;;       (Thread/sleep 10000)
-;;       (.killTopology nimbus "test")
-;;       (Thread/sleep 10000)
-;;       )))
-
-;; (deftest test-multilang-rb
-;;   (with-local-cluster [cluster :supervisors 4]
-;;     (let [nimbus (:nimbus cluster)
-;;           topology (thrift/mk-topology
-;;                       {1 (thrift/mk-spout-spec (TestWordSpout. false))}
-;;                       {2 (thrift/mk-shell-bolt-spec {1 :shuffle} "ruby" "tester.rb" ["word"] :parallelism-hint 1)}
-;;                       )]
-;;       (submit-local-topology nimbus
-;;                           "test"
-;;                           {TOPOLOGY-OPTIMIZE false TOPOLOGY-WORKERS 20 TOPOLOGY-MESSAGE-TIMEOUT-SECS 3 TOPOLOGY-DEBUG true}
-;;                           topology)
-;;       (Thread/sleep 10000)
-;;       (.killTopology nimbus "test")
-;;       (Thread/sleep 10000)
-;;       )))
-
-
-(deftest test-multilang-py
-  (with-local-cluster [cluster :supervisors 4]
-    (let [nimbus (:nimbus cluster)
-          topology (thrift/mk-topology
-                      {1 (thrift/mk-spout-spec (TestWordSpout. false))}
-                      {2 (thrift/mk-shell-bolt-spec {1 :shuffle} "python" "tester.py" ["word"] :parallelism-hint 1)}
-                      )]
-      (submit-local-topology nimbus
-                          "test"
-                          {TOPOLOGY-OPTIMIZE false TOPOLOGY-WORKERS 20 TOPOLOGY-MESSAGE-TIMEOUT-SECS 3 TOPOLOGY-DEBUG true}
-                          topology)
-      (Thread/sleep 10000)
-      (.killTopology nimbus "test")
-      (Thread/sleep 10000)
-      )))
-
-
 (deftest test-basic-topology
   (doseq [zmq-on? [true false]]
     (with-simulated-time-local-cluster [cluster :supervisors 4
                                         :daemon-conf {STORM-LOCAL-MODE-ZMQ zmq-on?}]
       (let [topology (thrift/mk-topology
-                      {1 (thrift/mk-spout-spec (TestWordSpout. true) :parallelism-hint 3)}
-                      {2 (thrift/mk-bolt-spec {1 ["word"]} (TestWordCounter.) :parallelism-hint 4)
-                       3 (thrift/mk-bolt-spec {1 :global} (TestGlobalCount.))
-                       4 (thrift/mk-bolt-spec {2 :global} (TestAggregatesCounter.))
+                      {"1" (thrift/mk-spout-spec (TestWordSpout. true) :parallelism-hint 3)}
+                      {"2" (thrift/mk-bolt-spec {"1" ["word"]} (TestWordCounter.) :parallelism-hint 4)
+                       "3" (thrift/mk-bolt-spec {"1" :global} (TestGlobalCount.))
+                       "4" (thrift/mk-bolt-spec {"2" :global} (TestAggregatesCounter.))
                        })
             results (complete-topology cluster
                                        topology
-                                       :mock-sources {1 [["nathan"] ["bob"] ["joey"] ["nathan"]]}
-                                       :storm-conf {TOPOLOGY-DEBUG true
-                                                    TOPOLOGY-WORKERS 2})]
+                                       :mock-sources {"1" [["nathan"] ["bob"] ["joey"] ["nathan"]]}
+                                       :storm-conf {TOPOLOGY-WORKERS 2})]
         (is (ms= [["nathan"] ["bob"] ["joey"] ["nathan"]]
-                 (read-tuples results 1)))
+                 (read-tuples results "1")))
         (is (ms= [["nathan" 1] ["nathan" 2] ["bob" 1] ["joey" 1]]
-                 (read-tuples results 2)))
+                 (read-tuples results "2")))
         (is (= [[1] [2] [3] [4]]
-               (read-tuples results 3)))
+               (read-tuples results "3")))
         (is (= [[1] [2] [3] [4]]
-               (read-tuples results 4)))
+               (read-tuples results "4")))
         ))))
 
-(deftest test-shuffle
+(defbolt emit-task-id ["tid"] {:prepare true}
+  [conf context collector]
+  (let [tid (.getThisTaskIndex context)]
+    (bolt
+      (execute [tuple]
+        (emit-bolt! collector [tid] :anchor tuple)
+        (ack! collector tuple)
+        ))))
+
+(deftest test-multi-tasks-per-executor
   (with-simulated-time-local-cluster [cluster :supervisors 4]
     (let [topology (thrift/mk-topology
-                    {1 (thrift/mk-spout-spec (TestWordSpout. true) :parallelism-hint 4)}
-                    {2 (thrift/mk-bolt-spec {1 :shuffle} (TestGlobalCount.)
-                                            :parallelism-hint 6)
+                    {"1" (thrift/mk-spout-spec (TestWordSpout. true))}
+                    {"2" (thrift/mk-bolt-spec {"1" :shuffle} emit-task-id
+                      :parallelism-hint 3
+                      :conf {TOPOLOGY-TASKS 6})
                      })
           results (complete-topology cluster
                                      topology
-                                     ;; important for test that
-                                     ;; #tuples = multiple of 4 and 6
-                                     :mock-sources {1 [["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ["a"] ["b"]
-                                                       ]}
-                                     )]
-      (is (ms= (apply concat (repeat 6 [[1] [2] [3] [4]]))
-               (read-tuples results 2)))
+                                     :mock-sources {"1" [["a"] ["a"] ["a"] ["a"] ["a"] ["a"]]})]
+      (is (ms= [[0] [1] [2] [3] [4] [5]]
+               (read-tuples results "2")))
       )))
 
-(defbolt lalala-bolt1 ["word"] [tuple collector]
-  (let [ret (-> (.getValue tuple 0) (str "lalala"))]
-    (.emit collector tuple [ret])
-    (.ack collector tuple)
-    ))
-
-(defbolt lalala-bolt2 ["word"] {:prepare true}
+(defbolt ack-every-other {} {:prepare true}
   [conf context collector]
-  (let [state (atom nil)]
-    (reset! state "lalala")
+  (let [state (atom -1)]
     (bolt
       (execute [tuple]
-        (let [ret (-> (.getValue tuple 0) (str @state))]
-                (.emit collector tuple [ret])
-                (.ack collector tuple)
-                ))
-      )))
-      
-(defbolt lalala-bolt3 ["word"] {:prepare true :params [prefix]}
-  [conf context collector]
-  (let [state (atom nil)]
-    (bolt
-      (prepare [_ _ _]
-        (reset! state (str prefix "lalala")))
-      (execute [tuple]
-        (let [ret (-> (.getValue tuple 0) (str @state))]
-          (.emit collector tuple [ret])
-          (.ack collector tuple)
-          )))
-    ))
+        (let [val (swap! state -)]
+          (when (pos? val)
+            (ack! collector tuple)
+            ))))))
 
-(deftest test-clojure-bolt
-  (with-simulated-time-local-cluster [cluster :supervisors 4]
-    (let [nimbus (:nimbus cluster)
+(defn assert-loop [afn ids]
+  (while (not (every? afn ids))
+    (Thread/sleep 1)))
+
+(defn assert-acked [tracker & ids]
+  (assert-loop #(.isAcked tracker %) ids))
+
+(defn assert-failed [tracker & ids]
+  (assert-loop #(.isFailed tracker %) ids))
+
+(deftest test-timeout
+  (with-simulated-time-local-cluster [cluster :daemon-conf {TOPOLOGY-ENABLE-MESSAGE-TIMEOUTS true}]
+    (let [feeder (feeder-spout ["field1"])
+          tracker (AckFailMapTracker.)
+          _ (.setAckFailDelegate feeder tracker)
           topology (thrift/mk-topology
-                      {1 (thrift/mk-spout-spec (TestWordSpout. false))}
-                      {2 (thrift/mk-bolt-spec {1 :shuffle}
-                                              lalala-bolt1)
-                       3 (thrift/mk-bolt-spec {1 :shuffle}
-                                              lalala-bolt2)
-                       4 (thrift/mk-bolt-spec {1 :shuffle}
-                                              (lalala-bolt3 "_nathan_"))}
-                      )
-          results (complete-topology cluster
-                                     topology
-                                     :mock-sources {1 [["david"]
-                                                       ["adam"]
-                                                       ]}
-                                     )]
-      (is (ms= [["davidlalala"] ["adamlalala"]] (read-tuples results 2)))
-      (is (ms= [["davidlalala"] ["adamlalala"]] (read-tuples results 3)))
-      (is (ms= [["david_nathan_lalala"] ["adam_nathan_lalala"]] (read-tuples results 4)))
+                     {"1" (thrift/mk-spout-spec feeder)}
+                     {"2" (thrift/mk-bolt-spec {"1" :global} ack-every-other)})]      
+      (submit-local-topology (:nimbus cluster)
+                             "timeout-tester"
+                             {TOPOLOGY-MESSAGE-TIMEOUT-SECS 10}
+                             topology)
+      (.feed feeder ["a"] 1)
+      (.feed feeder ["b"] 2)
+      (.feed feeder ["c"] 3)
+      (advance-cluster-time cluster 9)
+      (assert-acked tracker 1 3)
+      (is (not (.isFailed tracker 2)))
+      (advance-cluster-time cluster 12)
+      (assert-failed tracker 2)
       )))
+
+(defn mk-validate-topology-1 []
+  (thrift/mk-topology
+                    {"1" (thrift/mk-spout-spec (TestWordSpout. true) :parallelism-hint 3)}
+                    {"2" (thrift/mk-bolt-spec {"1" ["word"]} (TestWordCounter.) :parallelism-hint 4)}))
+
+(defn mk-invalidate-topology-1 []
+  (thrift/mk-topology
+                    {"1" (thrift/mk-spout-spec (TestWordSpout. true) :parallelism-hint 3)}
+                    {"2" (thrift/mk-bolt-spec {"3" ["word"]} (TestWordCounter.) :parallelism-hint 4)}))
+
+(defn mk-invalidate-topology-2 []
+  (thrift/mk-topology
+                    {"1" (thrift/mk-spout-spec (TestWordSpout. true) :parallelism-hint 3)}
+                    {"2" (thrift/mk-bolt-spec {"1" ["non-exists-field"]} (TestWordCounter.) :parallelism-hint 4)}))
+
+(defn mk-invalidate-topology-3 []
+  (thrift/mk-topology
+                    {"1" (thrift/mk-spout-spec (TestWordSpout. true) :parallelism-hint 3)}
+                    {"2" (thrift/mk-bolt-spec {["1" "non-exists-stream"] ["word"]} (TestWordCounter.) :parallelism-hint 4)}))
+
+(defn try-complete-wc-topology [cluster topology]
+  (try (do
+         (complete-topology cluster
+                            topology
+                            :mock-sources {"1" [["nathan"] ["bob"] ["joey"] ["nathan"]]}
+                            :storm-conf {TOPOLOGY-WORKERS 2})
+         false)
+       (catch InvalidTopologyException e true)))
+
+(deftest test-validate-topology-structure
+  (with-simulated-time-local-cluster [cluster :supervisors 4]
+    (let [any-error1? (try-complete-wc-topology cluster (mk-validate-topology-1))
+          any-error2? (try-complete-wc-topology cluster (mk-invalidate-topology-1))
+          any-error3? (try-complete-wc-topology cluster (mk-invalidate-topology-2))
+          any-error4? (try-complete-wc-topology cluster (mk-invalidate-topology-3))]
+      (is (= any-error1? false))
+      (is (= any-error2? true))
+      (is (= any-error3? true))
+      (is (= any-error4? true)))))
+
+(defbolt identity-bolt ["num"]
+  [tuple collector]
+  (emit-bolt! collector (.getValues tuple) :anchor tuple)
+  (ack! collector tuple))
+
+(deftest test-system-stream
+  ;; this test works because mocking a spout splits up the tuples evenly among the tasks
+  (with-simulated-time-local-cluster [cluster]
+      (let [topology (thrift/mk-topology
+                      {"1" (thrift/mk-spout-spec (TestWordSpout. true) :p 3)}
+                      {"2" (thrift/mk-bolt-spec {"1" ["word"] ["1" "__system"] :global} identity-bolt :p 1)
+                       })
+            results (complete-topology cluster
+                                       topology
+                                       :mock-sources {"1" [["a"] ["b"] ["c"]]}
+                                       :storm-conf {TOPOLOGY-WORKERS 2})]
+        (is (ms= [["a"] ["b"] ["c"] ["startup"] ["startup"] ["startup"]]
+                 (read-tuples results "2")))
+        )))
 
 (defn ack-tracking-feeder [fields]
   (let [tracker (AckTracker.)]
@@ -219,31 +195,30 @@
   [tuple collector]
   (ack! collector tuple))
 
-(defbolt identity-bolt ["num"]
-  [tuple collector]
-  (emit-bolt! collector (.getValues tuple) :anchor tuple)
-  (ack! collector tuple))
-
 (deftest test-acking
   (with-tracked-cluster [cluster]
     (let [[feeder1 checker1] (ack-tracking-feeder ["num"])
           [feeder2 checker2] (ack-tracking-feeder ["num"])
           [feeder3 checker3] (ack-tracking-feeder ["num"])
           tracked (mk-tracked-topology
-                   {1 [feeder1]
-                    2 [feeder2]
-                    3 [feeder3]}
-                   {4 [{1 :shuffle} (branching-bolt 2)]
-                    5 [{2 :shuffle} (branching-bolt 4)]
-                    6 [{3 :shuffle} (branching-bolt 1)]
-                    7 [{4 :shuffle
-                        5 :shuffle
-                        6 :shuffle} (agg-bolt 3)]
-                    8 [{7 :shuffle} (branching-bolt 2)]
-                    9 [{8 :shuffle} ack-bolt]}
-                   )]
+                   cluster
+                   (topology
+                     {"1" (spout-spec feeder1)
+                      "2" (spout-spec feeder2)
+                      "3" (spout-spec feeder3)}
+                     {"4" (bolt-spec {"1" :shuffle} (branching-bolt 2))
+                      "5" (bolt-spec {"2" :shuffle} (branching-bolt 4))
+                      "6" (bolt-spec {"3" :shuffle} (branching-bolt 1))
+                      "7" (bolt-spec
+                            {"4" :shuffle
+                            "5" :shuffle
+                            "6" :shuffle}
+                            (agg-bolt 3))
+                      "8" (bolt-spec {"7" :shuffle} (branching-bolt 2))
+                      "9" (bolt-spec {"8" :shuffle} ack-bolt)}
+                     ))]
       (submit-local-topology (:nimbus cluster)
-                             "test"
+                             "acking-test1"
                              {}
                              (:topology tracked))
       (.feed feeder1 [1])
@@ -275,13 +250,17 @@
   (with-tracked-cluster [cluster]
     (let [[feeder checker] (ack-tracking-feeder ["num"])
           tracked (mk-tracked-topology
-                   {1 [feeder]}
-                   {2 [{1 :shuffle} identity-bolt]
-                    3 [{1 :shuffle} identity-bolt]
-                    4 [{2 :shuffle
-                        3 :shuffle} (agg-bolt 4)]})]
+                   cluster
+                   (topology
+                     {"1" (spout-spec feeder)}
+                     {"2" (bolt-spec {"1" :shuffle} identity-bolt)
+                      "3" (bolt-spec {"1" :shuffle} identity-bolt)
+                      "4" (bolt-spec
+                            {"2" :shuffle
+                             "3" :shuffle}
+                             (agg-bolt 4))}))]
       (submit-local-topology (:nimbus cluster)
-                             "test"
+                             "test-acking2"
                              {}
                              (:topology tracked))
       (.feed feeder [1])
@@ -301,9 +280,11 @@
   (with-tracked-cluster [cluster]
     (let [[feeder checker] (ack-tracking-feeder ["num"])
           tracked (mk-tracked-topology
-                   {1 [feeder]}
-                   {2 [{1 :shuffle} dup-anchor]
-                    3 [{2 :shuffle} ack-bolt]})]
+                   cluster
+                   (topology
+                     {"1" (spout-spec feeder)}
+                     {"2" (bolt-spec {"1" :shuffle} dup-anchor)
+                      "3" (bolt-spec {"2" :shuffle} ack-bolt)}))]
       (submit-local-topology (:nimbus cluster)
                              "test"
                              {}
@@ -389,6 +370,123 @@
 ;;       (Thread/sleep 10000)
 ;;       )))
 
+(deftest test-kryo-decorators-config
+  (with-simulated-time-local-cluster [cluster
+                                      :daemon-conf {TOPOLOGY-OPTIMIZE false
+                                                    TOPOLOGY-SKIP-MISSING-KRYO-REGISTRATIONS true
+                                                    TOPOLOGY-KRYO-DECORATORS ["this-is-overriden"]}]
+    (letlocals
+     (bind builder (TopologyBuilder.))
+     (.setSpout builder "1" (TestPlannerSpout. (Fields. ["conf"])))
+     (-> builder
+         (.setBolt "2"
+                   (TestConfBolt.
+                    {TOPOLOGY-KRYO-DECORATORS ["one" "two"]}))
+         (.shuffleGrouping "1"))
+     
+     (bind results
+           (complete-topology cluster
+                              (.createTopology builder)
+                              :storm-conf {TOPOLOGY-KRYO-DECORATORS ["one" "three"]}
+                              :mock-sources {"1" [[TOPOLOGY-KRYO-DECORATORS]]}))
+     (is (= {"topology.kryo.decorators" (list "one" "two" "three")}            
+            (->> (read-tuples results "2")
+                 (apply concat)
+                 (apply hash-map)))))))
+
+(deftest test-component-specific-config
+  (with-simulated-time-local-cluster [cluster
+                                      :daemon-conf {TOPOLOGY-OPTIMIZE false
+                                                    TOPOLOGY-SKIP-MISSING-KRYO-REGISTRATIONS true}]
+    (letlocals
+     (bind builder (TopologyBuilder.))
+     (.setSpout builder "1" (TestPlannerSpout. (Fields. ["conf"])))
+     (-> builder
+         (.setBolt "2"
+                   (TestConfBolt.
+                    {"fake.config" 123
+                     TOPOLOGY-MAX-TASK-PARALLELISM 20
+                     TOPOLOGY-MAX-SPOUT-PENDING 30
+                     TOPOLOGY-OPTIMIZE true
+                     TOPOLOGY-KRYO-REGISTER [{"fake.type" "bad.serializer"}
+                                             {"fake.type2" "a.serializer"}]
+                     }))
+         (.shuffleGrouping "1")
+         (.setMaxTaskParallelism (int 2))
+         (.addConfiguration "fake.config2" 987)
+         )
+     
+
+     (bind results
+           (complete-topology cluster
+                              (.createTopology builder)
+                              :storm-conf {TOPOLOGY-KRYO-REGISTER [{"fake.type" "good.serializer" "fake.type3" "a.serializer3"}]}
+                              :mock-sources {"1" [["fake.config"]
+                                                  [TOPOLOGY-MAX-TASK-PARALLELISM]
+                                                  [TOPOLOGY-MAX-SPOUT-PENDING]
+                                                  [TOPOLOGY-OPTIMIZE]
+                                                  ["fake.config2"]
+                                                  [TOPOLOGY-KRYO-REGISTER]
+                                                  ]}))
+     (is (= {"fake.config" 123
+             "fake.config2" 987
+             TOPOLOGY-MAX-TASK-PARALLELISM 2
+             TOPOLOGY-MAX-SPOUT-PENDING 30
+             TOPOLOGY-OPTIMIZE false
+             TOPOLOGY-KRYO-REGISTER {"fake.type" "good.serializer"
+                                     "fake.type2" "a.serializer"
+                                     "fake.type3" "a.serializer3"}}
+            (->> (read-tuples results "2")
+                 (apply concat)
+                 (apply hash-map))
+            ))
+     )))
+
+(defbolt hooks-bolt ["emit" "ack" "fail"] {:prepare true}
+  [conf context collector]
+  (let [acked (atom 0)
+        failed (atom 0)
+        emitted (atom 0)]
+    (.addTaskHook context
+                  (reify backtype.storm.hooks.ITaskHook
+                    (prepare [this conf context]
+                      )
+                    (cleanup [this]
+                      )
+                    (emit [this info]
+                      (swap! emitted inc))
+                    (boltAck [this info]
+                      (swap! acked inc))
+                    (boltFail [this info]
+                      (swap! failed inc))))
+    (bolt
+     (execute [tuple]
+        (emit-bolt! collector [@emitted @acked @failed])
+        (if (= 0 (- @acked @failed))
+          (ack! collector tuple)
+          (fail! collector tuple))
+        ))))
+
+(deftest test-hooks
+  (with-simulated-time-local-cluster [cluster]
+    (let [topology (topology {"1" (spout-spec (TestPlannerSpout. (Fields. ["conf"])))
+                              }
+                             {"2" (bolt-spec {"1" :shuffle}
+                                             hooks-bolt)
+                              })
+          results (complete-topology cluster
+                                     topology
+                                     :mock-sources {"1" [[1]
+                                                         [1]
+                                                         [1]
+                                                         [1]
+                                                         ]})]
+      (is (= [[0 0 0]
+              [2 1 0]
+              [4 1 1]
+              [6 2 1]]
+             (read-tuples results "2")
+             )))))
 
 (deftest test-acking-branching-complex
   ;; test acking with branching in the topology

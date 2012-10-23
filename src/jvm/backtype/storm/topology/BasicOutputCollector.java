@@ -15,7 +15,7 @@ public class BasicOutputCollector implements IBasicOutputCollector {
         this.out = out;
     }
 
-    public List<Integer> emit(int streamId, List<Object> tuple) {
+    public List<Integer> emit(String streamId, List<Object> tuple) {
         return out.emit(streamId, inputTuple, tuple);
     }
 
@@ -27,11 +27,7 @@ public class BasicOutputCollector implements IBasicOutputCollector {
         this.inputTuple = inputTuple;
     }
 
-    public IOutputCollector getOutputter() {
-        return out;
-    }
-
-    public void emitDirect(int taskId, int streamId, List<Object> tuple) {
+    public void emitDirect(int taskId, String streamId, List<Object> tuple) {
         out.emitDirect(taskId, streamId, inputTuple, tuple);
     }
 
@@ -39,4 +35,11 @@ public class BasicOutputCollector implements IBasicOutputCollector {
         emitDirect(taskId, Utils.DEFAULT_STREAM_ID, tuple);
     }
 
+    protected IOutputCollector getOutputter() {
+        return out;
+    }
+
+    public void reportError(Throwable t) {
+        out.reportError(t);
+    }
 }

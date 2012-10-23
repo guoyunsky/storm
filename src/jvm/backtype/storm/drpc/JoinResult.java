@@ -2,8 +2,8 @@ package backtype.storm.drpc;
 
 import backtype.storm.task.OutputCollector;
 import backtype.storm.task.TopologyContext;
-import backtype.storm.topology.IRichBolt;
 import backtype.storm.topology.OutputFieldsDeclarer;
+import backtype.storm.topology.base.BaseRichBolt;
 import backtype.storm.tuple.Fields;
 import backtype.storm.tuple.Tuple;
 import backtype.storm.tuple.Values;
@@ -14,15 +14,15 @@ import java.util.Map;
 import org.apache.log4j.Logger;
 
 
-public class JoinResult implements IRichBolt {
+public class JoinResult extends BaseRichBolt {
     public static Logger LOG = Logger.getLogger(JoinResult.class);
 
-    int returnComponent;
+    String returnComponent;
     Map<Object, Tuple> returns = new HashMap<Object, Tuple>();
     Map<Object, Tuple> results = new HashMap<Object, Tuple>();
     OutputCollector _collector;
 
-    public JoinResult(int returnComponent) {
+    public JoinResult(String returnComponent) {
         this.returnComponent = returnComponent;
     }
  
@@ -32,7 +32,7 @@ public class JoinResult implements IRichBolt {
 
     public void execute(Tuple tuple) {
         Object requestId = tuple.getValue(0);
-        if(tuple.getSourceComponent()==returnComponent) {
+        if(tuple.getSourceComponent().equals(returnComponent)) {
             returns.put(requestId, tuple);
         } else {
             results.put(requestId, tuple);
@@ -51,12 +51,7 @@ public class JoinResult implements IRichBolt {
         }
     }
 
-    public void cleanup() {
-    }
-
     public void declareOutputFields(OutputFieldsDeclarer declarer) {
         declarer.declare(new Fields("result", "return-info"));
     }
-
-
 }
